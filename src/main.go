@@ -27,16 +27,16 @@ import (
 const (
 	SharedSecret       = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
 	Version            = "2.2"                              // Version of the script
-	IPv6Prefix         = "xxxx:xxxx:xxxx"                   // Your /48 prefix
-	IPv6Subnet         = "1000"                             // Using subnet 1000 within your /48
+	IPv6Prefix         = "2a01:e5c0:2d74"                   // Your /48 prefix
+	IPv6Subnet         = "5000"                             // Using subnet 1000 within your /48
 	Interface          = "ens3"                             // Detected interface from your system
 	ListenPort         = 80                                 // Proxy server port
 	ListenHost         = "0.0.0.0"                          // Listen on all interfaces
 	RequestTimeout     = 30 * time.Second                   // Request timeout in seconds
 	Debug              = false                              // Enable debug output
-	DesiredPoolSize    = 100                                // Target number of IPs in the pool
+	DesiredPoolSize    = 1000                                // Target number of IPs in the pool (Reduced for testing)
 	PoolManageInterval = 5 * time.Second                    // Check/add less frequently (every 5 seconds)
-	PoolAddBatchSize   = 5                                  // Try to add up to 5 IPs per cycle if needed
+	PoolAddBatchSize   = 15                                 // Try to add up to 5 IPs per cycle if needed
 )
 
 var random *rand.Rand
