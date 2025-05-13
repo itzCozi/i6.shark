@@ -34,12 +34,11 @@ const (
 	ListenHost         = "0.0.0.0"                          // Listen on all interfaces
 	RequestTimeout     = 30 * time.Second                   // Request timeout in seconds
 	Debug              = false                              // Enable debug output
-	DesiredPoolSize    = 1000                                // Target number of IPs in the pool (Reduced for testing)
+	DesiredPoolSize    = 6000                               // Target number of IPs in the pool (Reduced for testing)
 	PoolManageInterval = 5 * time.Second                    // Check/add less frequently (every 5 seconds)
 	PoolAddBatchSize   = 15                                 // Try to add up to 5 IPs per cycle if needed
 )
 
-var random *rand.Rand
 var requestCount int
 var defaultClient *http.Client
 var defaultTransport *http.Transport
@@ -573,7 +572,6 @@ func onStartup() bool {
 }
 
 func main() {
-	random = rand.New(rand.NewSource(time.Now().UnixNano()))
 	ipPool = make([]string, 0, DesiredPoolSize)
 	currentIPIndex = 0
 
