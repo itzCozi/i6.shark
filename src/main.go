@@ -20,16 +20,17 @@ import (
 	"time"
 
 	"compress/gzip" // <-- ADD THIS LINE if it's missing
+
 	"github.com/andybalholm/brotli"
 	"github.com/vishvananda/netlink"
 )
 
 const (
-	SharedSecret       = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
+	SharedSecret       = "Yxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
 	Version            = "2.2"                              // Version of the script
-	IPv6Prefix         = "2a01:e5c0:2d74"                   // Your /48 prefix
+	IPv6Prefix         = "xxxx:xxxx:xxxx"                   // Your /48 prefix
 	IPv6Subnet         = "5000"                             // Using subnet 1000 within your /48
-	Interface          = "ens3"                             // Detected interface from your system
+	Interface          = "xxxx"                             // Detected interface from your system
 	ListenPort         = 80                                 // Proxy server port
 	ListenHost         = "0.0.0.0"                          // Listen on all interfaces
 	RequestTimeout     = 30 * time.Second                   // Request timeout in seconds
@@ -55,6 +56,24 @@ var skipHeaders = map[string]bool{
 	"connection":        true,
 	"keep-alive":        true,
 	"server":            true,
+}
+
+// headersToStripBeforeForwarding defines request headers that should be removed
+// from the incoming client request before forwarding it to the target server.
+// Headers are stored in lowercase for case-insensitive matching.
+var headersToStripBeforeForwarding = map[string]bool{
+	"cf-connecting-ip":  true, // Reveals original client IP to Cloudflare
+	"cf-ipcountry":      true, // Reveals client's country via Cloudflare
+	"cf-ray":            true, // Cloudflare's request tracing ID
+	"cf-visitor":        true, // Contains scheme used by client to connect to Cloudflare
+	"cf-worker":         true, // Identifies the request came from a Cloudflare Worker
+	"cf-ew-via":         true, // Indicates request routed via Cloudflare Edge Workers/services
+	"x-forwarded-for":   true, // Standard header for identifying originating IP of a client connecting through proxies
+	"x-forwarded-proto": true, // Standard header for identifying protocol client used to connect
+	"cdn-loop":          true, // Indicates a CDN loop, often set by CDNs
+	"true-client-ip":    true, // Alternative header for original client IP
+	"x-real-ip":         true, // Common alternative for original client IP, often set by reverse proxies
+	// Add any other headers here that might reveal the proxy chain or original client context undesirably
 }
 
 func minInt(x, y int) int {
@@ -184,7 +203,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	userAgent := r.Header.Get("User-Agent")
 
 	if !validateAPIToken(apiToken, userAgent) {
-		http.Error(w, "Unauthorized: i6.shark detected invalid API-Token.", http.StatusUnauthorized)
+		http.Error(w, "Unauthorized: i6.shark detected invalid API-Token header.", http.StatusUnauthorized)
 		return
 	}
 
@@ -192,11 +211,47 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	if Debug {
 		fmt.Printf("Raw query string: %s\n", r.URL.RawQuery)
+		fmt.Println("Incoming request headers received by proxy:")
+		for name, values := range r.Header {
+			for _, value := range values {
+				fmt.Printf("  %s: %s\n", name, value)
+			}
+		}
 	}
 
 	targetURL := r.URL.Query().Get("url")
+	
+	if targetURL != "" {
+		parsedURL, err := url.Parse(ensureURLHasScheme(targetURL))
+		if err != nil || parsedURL.Host == "" {
+			http.Error(w, "Invalid URL format", http.StatusBadRequest)
+			return
+		}
+
+		hostname := parsedURL.Host
+		allowedHosts := []string{"rest.opensubtitles.org", "dl.opensubtitles.org", "subdl.com"}
+		isAllowed := false
+
+		for _, allowed := range allowedHosts {
+			if hostname == allowed || strings.HasSuffix(hostname, "."+allowed) {
+				isAllowed = true
+				break
+			}
+		}
+
+		if !isAllowed {
+			fmt.Printf("Rejected request to unauthorized hostname: %s\n", hostname)
+			http.Error(w, "Access to this host is not allowed", http.StatusForbidden)
+			return
+		}
+	}
+
 	if Debug {
-		fmt.Printf("Retrieved 'url' parameter (decoded): %s\n", targetURL)
+		fmt.Printf("Raw 'url' parameter (decoded): %#v\n", targetURL)
+	}
+	targetURL = strings.TrimSpace(targetURL)
+	if Debug {
+		fmt.Printf("Trimmed 'url' parameter: %#v\n", targetURL)
 	}
 	headersJSON := r.URL.Query().Get("headers")
 	useNormalParam := r.URL.Query().Has("normal")
@@ -210,13 +265,17 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	parsedURL, err := url.Parse(targetURL)
 	if Debug {
 		if err != nil {
-			fmt.Printf("Error parsing decoded URL '%s': %v\n", targetURL, err)
+			fmt.Printf("Error parsing trimmed & schemed URL '%s': %v\n", targetURL, err)
 		} else {
-			fmt.Printf("Successfully parsed decoded URL: %s (Host: %s)\n", parsedURL.String(), parsedURL.Host)
+			fmt.Printf("Successfully parsed trimmed & schemed URL: %s (Host: %s)\n", parsedURL.String(), parsedURL.Host)
 		}
 	}
 	if err != nil || parsedURL.Host == "" {
-		fmt.Printf("Error parsing URL or empty hostname: %v\n", err)
+		errMsg := fmt.Sprintf("Invalid URL (parsing failed or host empty): %s. Original error: %v", targetURL, err)
+		if err == nil && parsedURL.Host == "" {
+			errMsg = fmt.Sprintf("Invalid URL (empty host after parsing): %s", targetURL)
+		}
+		fmt.Printf("%s\n", errMsg)
 		http.Error(w, fmt.Sprintf("Invalid URL: %s.", targetURL), http.StatusBadRequest)
 		return
 	}
@@ -249,25 +308,43 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	headers := make(http.Header)
+	// Prepare headers for the outgoing request
+	forwardedHeaders := make(http.Header)
+	// Copy headers from original client request, stripping unwanted ones
 	for name, values := range r.Header {
-		if strings.ToLower(name) != "host" {
-			headers[name] = values
+		lowerName := strings.ToLower(name)
+
+		// The http.Client will set the Host header correctly based on outRequest.URL.Host.
+		// We should not blindly copy the Host header from the incoming client request.
+		if lowerName == "host" {
+			continue
 		}
+
+		// Strip headers defined in the headersToStripBeforeForwarding map
+		if headersToStripBeforeForwarding[lowerName] {
+			if Debug {
+				fmt.Printf("Stripping incoming header before forwarding: %s: %v\n", name, values)
+			}
+			continue
+		}
+		// If not stripped, copy the header and its values
+		forwardedHeaders[name] = values
 	}
 
+	// Apply custom headers from 'headers' query parameter if provided.
+	// This happens AFTER stripping, so user-provided headers via query take precedence.
 	if headersJSON != "" {
 		var customHeaders map[string]string
 		err := json.Unmarshal([]byte(headersJSON), &customHeaders)
 		if err == nil {
 			for name, value := range customHeaders {
-				headers.Set(name, value)
+				forwardedHeaders.Set(name, value) // Set (or overwrite) in the forwardedHeaders
 			}
 			if Debug {
-				fmt.Printf("Applied custom headers: %v\n", customHeaders)
+				fmt.Printf("Applied custom headers from query: %v\n", customHeaders)
 			}
 		} else {
-			fmt.Println("Warning: Failed to parse 'headers' JSON. Ignoring.")
+			fmt.Printf("Warning: Failed to parse 'headers' JSON query parameter: %v. Ignoring.\n", err)
 		}
 	}
 
@@ -319,7 +396,17 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		outRequest.Body = nil
 	}
 
-	outRequest.Header = headers
+	outRequest.Header = forwardedHeaders // Use the processed forwardedHeaders
+
+	if Debug {
+		fmt.Println("Outgoing request headers being sent by proxy to target:")
+		for name, values := range outRequest.Header {
+			for _, value := range values {
+				fmt.Printf("  %s: %s\n", name, value)
+			}
+		}
+	}
+
 	fmt.Printf("Connecting to %s using source IP %s (via %s)...\n",
 		targetURL, sourceIP,
 		func() string {
