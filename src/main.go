@@ -26,10 +26,10 @@ import (
 )
 
 const (
-	SharedSecret       = "Yxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
+	SharedSecret       = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
 	Version            = "2.2"                              // Version of the script
 	IPv6Prefix         = "xxxx:xxxx:xxxx"                   // Your /48 prefix
-	IPv6Subnet         = "5000"                             // Using subnet 1000 within your /48
+	IPv6Subnet         = "6000"                             // Using subnet 1000 within your /48
 	Interface          = "xxxx"                             // Detected interface from your system
 	ListenPort         = 80                                 // Proxy server port
 	ListenHost         = "0.0.0.0"                          // Listen on all interfaces
@@ -73,7 +73,6 @@ var headersToStripBeforeForwarding = map[string]bool{
 	"cdn-loop":          true, // Indicates a CDN loop, often set by CDNs
 	"true-client-ip":    true, // Alternative header for original client IP
 	"x-real-ip":         true, // Common alternative for original client IP, often set by reverse proxies
-	// Add any other headers here that might reveal the proxy chain or original client context undesirably
 }
 
 func minInt(x, y int) int {
@@ -220,7 +219,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetURL := r.URL.Query().Get("url")
-	
+
 	if targetURL != "" {
 		parsedURL, err := url.Parse(ensureURLHasScheme(targetURL))
 		if err != nil || parsedURL.Host == "" {
