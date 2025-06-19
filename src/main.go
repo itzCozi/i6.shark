@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip" // <-- ADD THIS LINE if it's missing
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,20 +18,19 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"compress/gzip" // <-- ADD THIS LINE if it's missing
 
 	"github.com/andybalholm/brotli"
 	"github.com/vishvananda/netlink"
 )
 
 const (
-	SharedSecret       = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
+	SharedSecret       = "YCLKMuY0F3xhn.QFwLZ1zYG-6Y3GH_cc" // Secret between client & server
 	Version            = "2.2"                              // Version of the script
-	IPv6Prefix         = "xxxx:xxxx:xxxx"                   // Your /48 prefix
+	IPv6Prefix         = "2a01:e5c0:9513"                   // Your /48 prefix
 	IPv6Subnet         = "6000"                             // Using subnet 1000 within your /48
-	Interface          = "xxxx"                             // Detected interface from your system
+	Interface          = "ens3"                             // Detected interface from your system
 	ListenPort         = 80                                 // Proxy server port
 	ListenHost         = "0.0.0.0"                          // Listen on all interfaces
 	RequestTimeout     = 30 * time.Second                   // Request timeout in seconds
@@ -38,6 +38,7 @@ const (
 	DesiredPoolSize    = 6000                               // Target number of IPs in the pool (Reduced for testing)
 	PoolManageInterval = 5 * time.Second                    // Check/add less frequently (every 5 seconds)
 	PoolAddBatchSize   = 15                                 // Try to add up to 5 IPs per cycle if needed
+	IPFlushInterval    = 1 * time.Hour                      // Flush all IPs every hour
 )
 
 var requestCount int
@@ -174,6 +175,66 @@ func removeIPv6FromInterface(ipv6 string) bool {
 		fmt.Printf("removeIPv6: Successfully removed %s from %s via netlink.\n", ipv6, Interface)
 	}
 	return true
+}
+
+// flushAllIPAddresses removes all IPv6 addresses from the interface that match our prefix pattern
+func flushAllIPAddresses() {
+	fmt.Println("Starting complete IPv6 address flush...")
+
+	link, err := netlink.LinkByName(Interface)
+	if err != nil {
+		fmt.Printf("Error finding interface %s during flush: %v\n", Interface, err)
+		return
+	}
+
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	if err != nil {
+		fmt.Printf("Error listing IPv6 addresses during flush: %v\n", err)
+		return
+	}
+
+	var wg sync.WaitGroup
+	var flushedCount int32 // Changed to int32 for atomic operations
+
+	for _, addr := range addrs {
+		ipStr := addr.IP.String()
+		// Only flush IPs that match our prefix
+		if strings.HasPrefix(ipStr, IPv6Prefix+":"+IPv6Subnet) {
+			wg.Add(1)
+			go func(address netlink.Addr) {
+				defer wg.Done()
+				err := netlink.AddrDel(link, &address)
+				if err != nil {
+					fmt.Printf("Failed to remove %s during flush: %v\n", address.IP.String(), err)
+				} else {
+					atomic.AddInt32(&flushedCount, 1) // Fixed: proper int32 pointer
+				}
+			}(addr)
+		}
+	}
+
+	wg.Wait()
+
+	// Clear the IP pool
+	poolMutex.Lock()
+	oldSize := len(ipPool)
+	ipPool = make([]string, 0, DesiredPoolSize)
+	currentIPIndex = 0
+	poolMutex.Unlock()
+
+	fmt.Printf("IP flush complete: removed %d addresses from interface, cleared %d IPs from pool\n",
+		flushedCount, oldSize)
+}
+
+// periodicIPFlush runs a complete IP flush at regular intervals
+func periodicIPFlush() {
+	ticker := time.NewTicker(IPFlushInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		fmt.Printf("Performing scheduled IP flush (interval: %s)\n", IPFlushInterval)
+		flushAllIPAddresses()
+	}
 }
 
 func ensureURLHasScheme(urlStr string) string {
@@ -684,6 +745,8 @@ func main() {
 	}
 
 	go manageIPPool()
+	go periodicIPFlush()
+
 	http.HandleFunc("/", handleRequest)
 
 	listenAddr := fmt.Sprintf("%s:%d", ListenHost, ListenPort)
