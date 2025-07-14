@@ -2,7 +2,8 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip" // <-- ADD THIS LINE if it's missing
+	"compress/gzip"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,32 +24,46 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	SharedSecret       = "YCLKMuY0F3xhn.QFwLZ1zYG-6Y3GH_cc" // Secret between client & server
-	Version            = "2.2"                              // Version of the script
-	IPv6Prefix         = "2a01:e5c0:9513"                   // Your /48 prefix
-	IPv6Subnet         = "6000"                             // Using subnet 1000 within your /48
-	Interface          = "ens3"                             // Detected interface from your system
-	ListenPort         = 80                                 // Proxy server port
-	ListenHost         = "0.0.0.0"                          // Listen on all interfaces
-	RequestTimeout     = 30 * time.Second                   // Request timeout in seconds
-	Debug              = false                              // Enable debug output
-	DesiredPoolSize    = 6000                               // Target number of IPs in the pool (Reduced for testing)
-	PoolManageInterval = 5 * time.Second                    // Check/add less frequently (every 5 seconds)
-	PoolAddBatchSize   = 15                                 // Try to add up to 5 IPs per cycle if needed
-	IPFlushInterval    = 1 * time.Hour                      // Flush all IPs every hour
+	SharedSecret          = "YCLKMuY0F3xhn.QFwLZ1zYG-6Y3GH_cc" // Secret between client & server
+	Version               = "2.2"                              // Version of the script
+	IPv6Prefix            = "2a01:e5c0:9513"                   // Your /48 prefix
+	IPv6Subnet            = "6000"                             // Using subnet 1000 within your /48
+	Interface             = "ens3"                             // Detected interface from your system
+	ListenPort            = 80                                 // Proxy server port
+	ListenHost            = "0.0.0.0"                          // Listen on all interfaces
+	RequestTimeout        = 30 * time.Second                   // Request timeout in seconds
+	Debug                 = false                              // Enable debug output
+	DesiredPoolSize       = 50                                 // Target number of IPs in the pool (Increased for high concurrency)
+	PoolManageInterval    = 1 * time.Second                    // Check/add very frequently with minimal blocking
+	PoolAddBatchSize      = 5                                  // Larger batches for faster pool growth
+	IPFlushInterval       = 1 * time.Hour                      // Flush all IPs every hour
+	MaxRequestsPerIP      = 15                                 // Maximum requests allowed per IP before rotation
+	UnusedIPFlushInterval = 10 * time.Minute                   // Check for unused IPs every 10 minutes
+	IPInactivityThreshold = 30 * time.Minute                   // Remove IP if unused for this duration
 )
+
+// IPUsageTracker tracks usage statistics for each IP address
+type IPUsageTracker struct {
+	IP           string    // The IPv6 address
+	RequestCount int       // Number of requests made with this IP
+	LastUsed     time.Time // Last time this IP was used for a request
+	Added        time.Time // When this IP was added to the pool
+	InUseCount   int32     // Number of ongoing requests using this IP (atomic)
+}
 
 var requestCount int
 var defaultClient *http.Client
 var defaultTransport *http.Transport
 
 var (
-	ipPool         []string
-	poolMutex      sync.Mutex
-	currentIPIndex int
+	ipPoolWithUsage []*IPUsageTracker
+	poolMutex       sync.Mutex
+	currentIPIndex  int
+	urgentAddChan   = make(chan struct{}, 10) // Channel to signal urgent IP additions
 )
 var skipHeaders = map[string]bool{
 	"transfer-encoding": true,
@@ -83,17 +98,41 @@ func minInt(x, y int) int {
 	return y
 }
 
+// normalizeIPv6 ensures IPv6 addresses are in canonical form without leading zeros
+func normalizeIPv6(ipStr string) string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ipStr // Return original if parsing fails
+	}
+	return ip.String()
+}
+
 func randomIPv6() string {
 	hostPart1 := rand.Uint32()
 	hostPart2 := rand.Uint32()
 
-	return fmt.Sprintf("%s:%s:%04x:%04x:%04x:%04x",
+	// Generate IPv6 address without leading zeros in segments
+	// Use %x instead of %04x to avoid leading zeros
+	rawIP := fmt.Sprintf("%s:%s:%x:%x:%x:%x",
 		IPv6Prefix,
 		IPv6Subnet,
 		(hostPart1>>16)&0xFFFF,
 		hostPart1&0xFFFF,
 		(hostPart2>>16)&0xFFFF,
 		hostPart2&0xFFFF)
+
+	ip := net.ParseIP(rawIP)
+	if ip == nil {
+		return fmt.Sprintf("%s:%s:%04x:%04x:%04x:%04x",
+			IPv6Prefix,
+			IPv6Subnet,
+			(hostPart1>>16)&0xFFFF,
+			hostPart1&0xFFFF,
+			(hostPart2>>16)&0xFFFF,
+			hostPart2&0xFFFF)
+	}
+
+	return ip.String()
 }
 
 func checkInterface() bool {
@@ -121,35 +160,66 @@ func checkInterface() bool {
 }
 
 func addIPv6ToInterface(ipv6 string) bool {
-	link, err := netlink.LinkByName(Interface)
-	if err != nil {
-		fmt.Printf("addIPv6: Failed to find link %s: %v\n", Interface, err)
-		return false
-	}
+	// Add timeout to prevent blocking
+	done := make(chan bool, 1)
 
-	addr, err := netlink.ParseAddr(ipv6 + "/128")
-	if err != nil {
-		fmt.Printf("addIPv6: Failed to parse address %s/128: %v\n", ipv6, err)
-		return false
-	}
-
-	err = netlink.AddrAdd(link, addr)
-	if err != nil {
-		if err.Error() == "file exists" {
-			if Debug {
-				fmt.Printf("addIPv6: Address %s already exists on %s (ignored).\n", ipv6, Interface)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("addIPv6: Recovered from panic adding %s: %v\n", ipv6, r)
+				done <- false
 			}
-			return true
-		} else {
-			fmt.Printf("addIPv6: Failed to add address %s to %s: %v\n", ipv6, Interface, err)
-			return false
-		}
-	}
+		}()
 
-	if Debug {
-		fmt.Printf("addIPv6: Successfully added %s to %s via netlink.\n", ipv6, Interface)
+		link, err := netlink.LinkByName(Interface)
+		if err != nil {
+			if Debug {
+				fmt.Printf("addIPv6: Failed to find link %s: %v\n", Interface, err)
+			}
+			done <- false
+			return
+		}
+
+		addr, err := netlink.ParseAddr(ipv6 + "/128")
+		if err != nil {
+			if Debug {
+				fmt.Printf("addIPv6: Failed to parse address %s/128: %v\n", ipv6, err)
+			}
+			done <- false
+			return
+		}
+
+		err = netlink.AddrAdd(link, addr)
+		if err != nil {
+			if err.Error() == "file exists" {
+				if Debug {
+					fmt.Printf("addIPv6: Address %s already exists on %s (ignored).\n", ipv6, Interface)
+				}
+				done <- true
+				return
+			} else {
+				if Debug {
+					fmt.Printf("addIPv6: Failed to add address %s to %s: %v\n", ipv6, Interface, err)
+				}
+				done <- false
+				return
+			}
+		}
+
+		if Debug {
+			fmt.Printf("addIPv6: Successfully added %s to %s via netlink.\n", ipv6, Interface)
+		}
+		done <- true
+	}()
+
+	// Wait for completion
+	select {
+	case result := <-done:
+		return result
+	case <-time.After(2 * time.Second):
+		fmt.Printf("addIPv6: Timeout adding %s to interface\n", ipv6)
+		return false
 	}
-	return true
 }
 
 func removeIPv6FromInterface(ipv6 string) bool {
@@ -165,16 +235,39 @@ func removeIPv6FromInterface(ipv6 string) bool {
 		return false
 	}
 
-	err = netlink.AddrDel(link, addr)
-	if err != nil {
-		fmt.Printf("removeIPv6: error removing address %s from %s: %v\n", ipv6, Interface, err)
-		return false
+	// Retry logic for network operations
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err = netlink.AddrDel(link, addr)
+		if err == nil {
+			if Debug {
+				fmt.Printf("removeIPv6: Successfully removed %s from %s via netlink (attempt %d).\n",
+					ipv6, Interface, attempt+1)
+			}
+			return true
+		}
+
+		// Check if address doesn't exist (not an error)
+		if strings.Contains(err.Error(), "cannot assign requested address") ||
+			strings.Contains(err.Error(), "no such file or directory") {
+			if Debug {
+				fmt.Printf("removeIPv6: Address %s not found on %s (already removed)\n", ipv6, Interface)
+			}
+			return true
+		}
+
+		if attempt == maxRetries-1 {
+			fmt.Printf("removeIPv6: error removing address %s from %s after %d attempts: %v\n",
+				ipv6, Interface, maxRetries, err)
+		} else if Debug {
+			fmt.Printf("removeIPv6: retry %d for %s: %v\n", attempt+1, ipv6, err)
+		}
+
+		// Small delay between retries
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 	}
 
-	if Debug {
-		fmt.Printf("removeIPv6: Successfully removed %s from %s via netlink.\n", ipv6, Interface)
-	}
-	return true
+	return false
 }
 
 // flushAllIPAddresses removes all IPv6 addresses from the interface that match our prefix pattern
@@ -187,43 +280,77 @@ func flushAllIPAddresses() {
 		return
 	}
 
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+	addrs, err := netlink.AddrList(link, unix.AF_INET6)
 	if err != nil {
 		fmt.Printf("Error listing IPv6 addresses during flush: %v\n", err)
 		return
 	}
 
-	var wg sync.WaitGroup
-	var flushedCount int32 // Changed to int32 for atomic operations
+	var flushedCount int32
+	var addressesToRemove []netlink.Addr
 
 	for _, addr := range addrs {
 		ipStr := addr.IP.String()
-		// Only flush IPs that match our prefix
-		if strings.HasPrefix(ipStr, IPv6Prefix+":"+IPv6Subnet) {
-			wg.Add(1)
-			go func(address netlink.Addr) {
-				defer wg.Done()
-				err := netlink.AddrDel(link, &address)
-				if err != nil {
-					fmt.Printf("Failed to remove %s during flush: %v\n", address.IP.String(), err)
-				} else {
-					atomic.AddInt32(&flushedCount, 1) // Fixed: proper int32 pointer
-				}
-			}(addr)
+		// Remove any IP that starts with our prefix, regardless of subnet
+		// This ensures we clean up old IPs from different subnets
+		if strings.HasPrefix(ipStr, IPv6Prefix+":") && !strings.Contains(ipStr, "::") {
+			addressesToRemove = append(addressesToRemove, addr)
+			if Debug {
+				fmt.Printf("Marked for removal: %s\n", ipStr)
+			}
 		}
+	}
+
+	fmt.Printf("Found %d IPv6 addresses to remove matching prefix %s:%s\n",
+		len(addressesToRemove), IPv6Prefix, IPv6Subnet)
+
+	// Remove addresses with limited concurrency to avoid overwhelming the system
+	const maxConcurrent = 10
+	semaphore := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+
+	for _, addr := range addressesToRemove {
+		wg.Add(1)
+		go func(address netlink.Addr) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Retry logic for network operations
+			maxRetries := 3
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				err := netlink.AddrDel(link, &address)
+				if err == nil {
+					atomic.AddInt32(&flushedCount, 1)
+					if Debug {
+						fmt.Printf("Successfully removed %s (attempt %d)\n", address.IP.String(), attempt+1)
+					}
+					break
+				} else {
+					if attempt == maxRetries-1 {
+						fmt.Printf("Failed to remove %s after %d attempts: %v\n",
+							address.IP.String(), maxRetries, err)
+					} else if Debug {
+						fmt.Printf("Retry %d for %s: %v\n", attempt+1, address.IP.String(), err)
+					}
+					// Small delay between retries
+					time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+				}
+			}
+		}(addr)
 	}
 
 	wg.Wait()
 
 	// Clear the IP pool
 	poolMutex.Lock()
-	oldSize := len(ipPool)
-	ipPool = make([]string, 0, DesiredPoolSize)
+	oldSize := len(ipPoolWithUsage)
+	ipPoolWithUsage = make([]*IPUsageTracker, 0, DesiredPoolSize)
 	currentIPIndex = 0
 	poolMutex.Unlock()
 
-	fmt.Printf("IP flush complete: removed %d addresses from interface, cleared %d IPs from pool\n",
-		flushedCount, oldSize)
+	fmt.Printf("IP flush complete: removed %d/%d addresses from interface, cleared %d IPs from pool\n",
+		flushedCount, len(addressesToRemove), oldSize)
 }
 
 // periodicIPFlush runs a complete IP flush at regular intervals
@@ -234,6 +361,195 @@ func periodicIPFlush() {
 	for range ticker.C {
 		fmt.Printf("Performing scheduled IP flush (interval: %s)\n", IPFlushInterval)
 		flushAllIPAddresses()
+	}
+}
+
+// flushUnusedIPs removes IPv6 addresses that haven't been used for a specified duration
+func flushUnusedIPs() {
+	poolMutex.Lock()
+	defer poolMutex.Unlock()
+
+	if len(ipPoolWithUsage) == 0 {
+		return
+	}
+
+	now := time.Now()
+	var ipsToRemove []string
+	newPool := make([]*IPUsageTracker, 0, len(ipPoolWithUsage))
+
+	for _, tracker := range ipPoolWithUsage {
+		inUseCount := atomic.LoadInt32(&tracker.InUseCount)
+
+		// Calculate how long the IP has been inactive
+		var inactiveTime time.Duration
+		if tracker.LastUsed.IsZero() {
+			// Never used - check how long since it was added
+			inactiveTime = now.Sub(tracker.Added)
+		} else {
+			// Used before - check how long since last use
+			inactiveTime = now.Sub(tracker.LastUsed)
+		}
+
+		// Remove if inactive for too long, hasn't reached request limit, and not currently in use
+		if inactiveTime > IPInactivityThreshold && tracker.RequestCount < MaxRequestsPerIP && inUseCount == 0 {
+			ipsToRemove = append(ipsToRemove, tracker.IP)
+			if Debug {
+				fmt.Printf("Marking unused IP %s for removal (inactive for %s, used %d times)\n",
+					tracker.IP, inactiveTime.Round(time.Minute), tracker.RequestCount)
+			}
+		} else {
+			newPool = append(newPool, tracker)
+			if inUseCount > 0 && Debug {
+				fmt.Printf("Keeping inactive IP %s temporarily (%d ongoing requests)\n",
+					tracker.IP, inUseCount)
+			}
+		}
+	}
+
+	ipPoolWithUsage = newPool
+
+	// Reset index if it's out of bounds
+	if currentIPIndex >= len(ipPoolWithUsage) && len(ipPoolWithUsage) > 0 {
+		currentIPIndex = 0
+	}
+
+	// Remove unused IPs from interface (done outside the lock)
+	if len(ipsToRemove) > 0 {
+		poolMutex.Unlock() // Unlock temporarily for interface operations
+
+		var wg sync.WaitGroup
+		for _, unusedIP := range ipsToRemove {
+			wg.Add(1)
+			go func(ip string) {
+				defer wg.Done()
+				removeIPv6FromInterface(ip)
+			}(unusedIP)
+		}
+		wg.Wait()
+
+		fmt.Printf("Removed %d unused IPs from interface and pool\n", len(ipsToRemove))
+
+		poolMutex.Lock() // Re-lock for the defer unlock
+	}
+}
+
+// periodicUnusedIPFlush runs unused IP cleanup at regular intervals
+func periodicUnusedIPFlush() {
+	ticker := time.NewTicker(UnusedIPFlushInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if Debug {
+			fmt.Printf("Checking for unused IPs (inactive threshold: %s)\n", IPInactivityThreshold)
+		}
+		flushUnusedIPs()
+	}
+}
+
+// cleanupWrongSubnetIPs removes any IPs that don't match the current subnet configuration
+// normalizeIPPool ensures all IPs in the pool are in canonical form
+func normalizeIPPool() {
+	poolMutex.Lock()
+	defer poolMutex.Unlock()
+
+	normalizedCount := 0
+	for _, tracker := range ipPoolWithUsage {
+		originalIP := tracker.IP
+		normalizedIP := normalizeIPv6(originalIP)
+		if originalIP != normalizedIP {
+			tracker.IP = normalizedIP
+			normalizedCount++
+			if Debug {
+				fmt.Printf("Normalized IP: %s -> %s\n", originalIP, normalizedIP)
+			}
+		}
+	}
+
+	if normalizedCount > 0 {
+		fmt.Printf("Normalized %d IPv6 addresses in pool to canonical form\n", normalizedCount)
+	}
+}
+
+func cleanupWrongSubnetIPs() {
+	fmt.Printf("Cleaning up IPs from wrong subnets (keeping only %s:%s:*)\n", IPv6Prefix, IPv6Subnet)
+
+	link, err := netlink.LinkByName(Interface)
+	if err != nil {
+		fmt.Printf("Error finding interface %s during subnet cleanup: %v\n", Interface, err)
+		return
+	}
+
+	addrs, err := netlink.AddrList(link, unix.AF_INET6)
+	if err != nil {
+		fmt.Printf("Error listing IPv6 addresses during subnet cleanup: %v\n", err)
+		return
+	}
+
+	expectedPrefix := IPv6Prefix + ":" + IPv6Subnet + ":"
+	var wrongSubnetIPs []netlink.Addr
+	var correctSubnetCount int
+
+	// Identify IPs that need to be removed
+	for _, addr := range addrs {
+		ipStr := addr.IP.String()
+		if strings.HasPrefix(ipStr, IPv6Prefix+":") && !strings.Contains(ipStr, "::") {
+			if !strings.HasPrefix(ipStr, expectedPrefix) {
+				wrongSubnetIPs = append(wrongSubnetIPs, addr)
+				fmt.Printf("Found wrong subnet IP: %s (expected prefix: %s)\n", ipStr, expectedPrefix)
+			} else {
+				correctSubnetCount++
+			}
+		}
+	}
+
+	// Remove wrong subnet IPs
+	if len(wrongSubnetIPs) > 0 {
+		var wg sync.WaitGroup
+		var removedCount int32
+
+		for _, addr := range wrongSubnetIPs {
+			wg.Add(1)
+			go func(address netlink.Addr) {
+				defer wg.Done()
+				err := netlink.AddrDel(link, &address)
+				if err != nil {
+					fmt.Printf("Failed to remove wrong subnet IP %s: %v\n", address.IP.String(), err)
+				} else {
+					atomic.AddInt32(&removedCount, 1)
+				}
+			}(addr)
+		}
+
+		wg.Wait()
+		fmt.Printf("Subnet cleanup complete: removed %d wrong subnet IPs, kept %d correct subnet IPs\n",
+			removedCount, correctSubnetCount)
+	} else {
+		fmt.Printf("Subnet cleanup: no wrong subnet IPs found, %d correct subnet IPs present\n", correctSubnetCount)
+	}
+
+	// Clean up the pool
+	poolMutex.Lock()
+	defer poolMutex.Unlock()
+
+	newPool := make([]*IPUsageTracker, 0, len(ipPoolWithUsage))
+	var poolCleaned int
+
+	for _, tracker := range ipPoolWithUsage {
+		if strings.HasPrefix(tracker.IP, expectedPrefix) {
+			newPool = append(newPool, tracker)
+		} else {
+			poolCleaned++
+			fmt.Printf("Removed wrong subnet IP from pool: %s\n", tracker.IP)
+		}
+	}
+
+	ipPoolWithUsage = newPool
+	if currentIPIndex >= len(ipPoolWithUsage) && len(ipPoolWithUsage) > 0 {
+		currentIPIndex = 0
+	}
+
+	if poolCleaned > 0 {
+		fmt.Printf("Cleaned %d wrong subnet IPs from pool\n", poolCleaned)
 	}
 }
 
@@ -289,7 +605,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		hostname := parsedURL.Host
-		allowedHosts := []string{"rest.opensubtitles.org", "dl.opensubtitles.org", "subdl.com"}
+		allowedHosts := []string{"rest.opensubtitles.org", "dl.opensubtitles.org", "subdl.com", "dl.subdl.com", "subf2m.co"}
 		isAllowed := false
 
 		for _, allowed := range allowedHosts {
@@ -353,7 +669,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		var poolErr error
 		sourceIP, poolErr = getNextIPFromPool()
 		if poolErr != nil {
-			fmt.Printf("Warning: IP Pool empty or error, falling back to system default IP. Error: %v\n", poolErr)
+			if strings.Contains(poolErr.Error(), "pool busy") {
+				if Debug {
+					fmt.Printf("Pool busy, using system default IP for this request\n")
+				}
+			} else {
+				fmt.Printf("Warning: IP Pool error, falling back to system default IP. Error: %v\n", poolErr)
+			}
 			sourceIP = "System default (fallback)"
 			useSpecificIP = false
 		} else {
@@ -363,12 +685,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				sourceIP = "System default (fallback)"
 				useSpecificIP = false
 			} else {
-				fmt.Printf("Using IP from pool: %s\n", sourceIP)
+				if Debug {
+					fmt.Printf("Using IP from pool: %s\n", sourceIP)
+				}
 			}
 		}
 	}
 
-	// Prepare headers for the outgoing request
 	forwardedHeaders := make(http.Header)
 	// Copy headers from original client request, stripping unwanted ones
 	for name, values := range r.Header {
@@ -387,7 +710,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		// If not stripped, copy the header and its values
 		forwardedHeaders[name] = values
 	}
 
@@ -411,19 +733,25 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	var client *http.Client
 
 	if useSpecificIP {
+		// Create a custom dialer with socket reuse options
+		dialer := &net.Dialer{
+			LocalAddr: &net.TCPAddr{IP: sourceNetIP, Port: 0},
+			Timeout:   RequestTimeout,
+			KeepAlive: 30 * time.Second,
+		}
+
+		// Create transport with optimized settings for high concurrency
 		specificTransport := &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				LocalAddr: &net.TCPAddr{IP: sourceNetIP, Port: 0},
-				Timeout:   RequestTimeout,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          10,
-			MaxIdleConnsPerHost:   5,
-			IdleConnTimeout:       60 * time.Second,
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           dialer.DialContext,
+			ForceAttemptHTTP2:     false,            // Disable HTTP/2 to reduce connection complexity
+			MaxIdleConns:          100,              // Increase idle connection pool
+			MaxIdleConnsPerHost:   20,               // Increase per-host idle connections
+			MaxConnsPerHost:       50,               // Limit concurrent connections per host
+			IdleConnTimeout:       30 * time.Second, // Shorter idle timeout
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
+			DisableKeepAlives:     false, // Keep connections alive for reuse
 		}
 		client = &http.Client{
 			Transport: specificTransport,
@@ -478,10 +806,43 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				return "default (fallback)"
 			}
 		}())
+
+	// Track IP usage for ongoing requests
+	if useSpecificIP {
+		defer func() {
+			// Find the IP in the pool and decrement its usage count
+			poolMutex.Lock()
+			defer poolMutex.Unlock()
+
+			normalizedIP := normalizeIPv6(sourceIP)
+			for _, tracker := range ipPoolWithUsage {
+				if normalizeIPv6(tracker.IP) == normalizedIP {
+					atomic.AddInt32(&tracker.InUseCount, -1)
+					if Debug {
+						fmt.Printf("Decremented usage for IP %s (now in-use: %d)\n",
+							normalizedIP, atomic.LoadInt32(&tracker.InUseCount))
+					}
+					break
+				}
+			}
+		}()
+	}
+
 	resp, err := client.Do(outRequest)
 
 	if err != nil {
 		fmt.Printf("ERROR using source IP %s for %s: %v\n", sourceIP, targetURL, err)
+
+		// If we get a bind error and we're using a specific IP, it might be due to port exhaustion
+		// Try to add more IPs to the pool urgently
+		if useSpecificIP && strings.Contains(err.Error(), "bind: cannot assign requested address") {
+			select {
+			case urgentAddChan <- struct{}{}:
+				fmt.Printf("Signaled urgent IP pool expansion due to bind error\n")
+			default:
+				// Channel full, signal already sent
+			}
+		}
 
 		if useSpecificIP {
 			fmt.Println("Attempting to get interface addresses via netlink during error...")
@@ -489,7 +850,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			if linkErr != nil {
 				fmt.Printf("  Error getting link %s: %v\n", Interface, linkErr)
 			} else {
-				addrs, addrErr := netlink.AddrList(link, netlink.FAMILY_V6)
+				addrs, addrErr := netlink.AddrList(link, unix.AF_INET6)
 				if addrErr != nil {
 					fmt.Printf("  Error listing addresses for %s: %v\n", Interface, addrErr)
 				} else {
@@ -512,10 +873,16 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 					fmt.Printf("Network Error likely due to unusable source IP %s on interface %s.\n", sourceIP, Interface)
 
 					poolMutex.Lock()
-					for i, ip := range ipPool {
-						if ip == sourceIP {
-							ipPool = append(ipPool[:i], ipPool[i+1:]...)
-							fmt.Printf("Removed bad IP %s from the pool.\n", sourceIP)
+					for i, tracker := range ipPoolWithUsage {
+						if tracker.IP == sourceIP {
+							ipPoolWithUsage = append(ipPoolWithUsage[:i], ipPoolWithUsage[i+1:]...)
+							fmt.Printf("Removed bad IP %s from the pool (was used %d times).\n",
+								sourceIP, tracker.RequestCount)
+
+							// Reset index if it's out of bounds
+							if currentIPIndex >= len(ipPoolWithUsage) && len(ipPoolWithUsage) > 0 {
+								currentIPIndex = 0
+							}
 							break
 						}
 					}
@@ -595,104 +962,331 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func getNextIPFromPool() (string, error) {
-	poolMutex.Lock()
+	// Use a very short timeout to avoid blocking requests
+	if !poolMutex.TryLock() {
+		// If we can't get the lock immediately, return an error to use default IP
+		return "", errors.New("pool busy, using default IP")
+	}
 	defer poolMutex.Unlock()
 
-	if len(ipPool) == 0 {
+	if len(ipPoolWithUsage) == 0 {
 		return "", errors.New("IP pool is empty")
 	}
 
-	for i := 0; i < len(ipPool); i++ {
-		index := currentIPIndex
-		currentIPIndex = (currentIPIndex + 1) % len(ipPool)
+	// First, try to find an IP that hasn't exceeded request limit AND is not currently in use
+	startIndex := currentIPIndex
+	for attempts := 0; attempts < len(ipPoolWithUsage); attempts++ {
+		tracker := ipPoolWithUsage[currentIPIndex]
 
-		if net.ParseIP(ipPool[index]) != nil {
-			return ipPool[index], nil
+		// Check if this IP can still be used (hasn't exceeded MaxRequestsPerIP AND not currently in use)
+		if tracker.RequestCount < MaxRequestsPerIP {
+			// Try to atomically claim this IP (only succeed if InUseCount was 0)
+			if atomic.CompareAndSwapInt32(&tracker.InUseCount, 0, 1) {
+				// Successfully claimed the IP - update tracking under mutex protection
+				tracker.RequestCount++
+				tracker.LastUsed = time.Now()
+
+				ip := normalizeIPv6(tracker.IP)
+
+				// Move to next IP for round-robin distribution
+				currentIPIndex = (currentIPIndex + 1) % len(ipPoolWithUsage)
+
+				if Debug {
+					fmt.Printf("Selected fresh IP %s (usage: %d/%d, in-use: %d, last used: %s)\n",
+						ip, tracker.RequestCount, MaxRequestsPerIP, atomic.LoadInt32(&tracker.InUseCount), tracker.LastUsed.Format("15:04:05"))
+				}
+
+				return ip, nil
+			}
 		}
 
-		fmt.Printf("Invalid IP found in pool: %s. Skipping...\n", ipPool[index])
+		// This IP has reached its limit or is in use, try the next one
+		currentIPIndex = (currentIPIndex + 1) % len(ipPoolWithUsage)
+
+		if currentIPIndex == startIndex {
+			break
+		}
 	}
 
-	return "", errors.New("no valid IPs in pool")
+	// If no fresh IPs are available, try to find an exhausted IP that's not currently in use
+	for attempts := 0; attempts < len(ipPoolWithUsage); attempts++ {
+		tracker := ipPoolWithUsage[currentIPIndex]
+
+		// Try to atomically claim this exhausted IP (only succeed if InUseCount was 0)
+		if atomic.CompareAndSwapInt32(&tracker.InUseCount, 0, 1) {
+			// Successfully claimed the exhausted IP - update tracking under mutex protection
+			tracker.RequestCount++
+			tracker.LastUsed = time.Now()
+
+			ip := normalizeIPv6(tracker.IP)
+
+			// Move to next IP for round-robin distribution
+			currentIPIndex = (currentIPIndex + 1) % len(ipPoolWithUsage)
+
+			if Debug {
+				fmt.Printf("WARNING: Using exhausted IP %s (usage: %d/%d, in-use: %d) - all fresh IPs exhausted\n",
+					ip, tracker.RequestCount, MaxRequestsPerIP, atomic.LoadInt32(&tracker.InUseCount))
+			}
+
+			return ip, nil
+		}
+
+		currentIPIndex = (currentIPIndex + 1) % len(ipPoolWithUsage)
+	}
+
+	// If ALL IPs are currently in use, we have no choice but to return an error
+	// This prevents the "bind: cannot assign requested address" errors
+	return "", errors.New("all IPs currently in use - try again")
 }
 
 func manageIPPool() {
-	fmt.Println("Starting IP pool manager...")
+	fmt.Println("Starting enhanced IP pool manager with usage tracking...")
 	ticker := time.NewTicker(PoolManageInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		poolMutex.Lock()
-		currentSize := len(ipPool)
-		needToAdd := currentSize < DesiredPoolSize
-		batchTarget := minInt(PoolAddBatchSize, DesiredPoolSize-currentSize)
-		shouldReplace := currentSize >= DesiredPoolSize
-		var ipsToRemove []string
-
-		if shouldReplace {
-			numToRemove := 1
-			if numToRemove > currentSize {
-				numToRemove = currentSize
-			}
-
-			ipsToRemove = make([]string, numToRemove)
-			copy(ipsToRemove, ipPool[:numToRemove])
-			ipPool = ipPool[numToRemove:]
-			currentSize -= numToRemove
-
-			if currentIPIndex >= currentSize && currentSize > 0 {
-				currentIPIndex = 0
-			}
+	for {
+		select {
+		case <-ticker.C:
+			// Regular pool management
+		case <-urgentAddChan:
+			// Urgent IP addition requested due to bind errors
+			fmt.Println("Processing urgent IP addition request...")
 		}
-		poolMutex.Unlock()
+		// Quick snapshot of pool state without holding lock for long
+		var currentSize, availableIPs, exhaustedIPs int
+		var needsUrgentAddition bool
 
-		if len(ipsToRemove) > 0 {
-			var wg sync.WaitGroup
-			for _, oldestIP := range ipsToRemove {
-				if oldestIP != "" {
-					wg.Add(1)
-					go func(ip string) {
-						defer wg.Done()
-						removeIPv6FromInterface(ip)
-					}(oldestIP)
+		func() {
+			poolMutex.Lock()
+			defer poolMutex.Unlock()
+			currentSize = len(ipPoolWithUsage)
+
+			for _, tracker := range ipPoolWithUsage {
+				if tracker.RequestCount < MaxRequestsPerIP {
+					availableIPs++
+				} else {
+					exhaustedIPs++
 				}
 			}
-			wg.Wait()
+
+			// Define minimum fresh IPs required for service continuity
+			minFreshIPsRequired := minInt(10, DesiredPoolSize/10)
+			needsUrgentAddition = exhaustedIPs > 0 && availableIPs < minFreshIPsRequired
+
+			// Don't remove exhausted IPs here - they'll be removed when new batch is ready
+			// This ensures we always have IPs available for requests
+			if Debug && exhaustedIPs > 0 {
+				fmt.Printf("Keeping %d exhausted IPs until new batch is ready (available: %d)\n",
+					exhaustedIPs, availableIPs)
+			}
+		}()
+
+		// Old IP removal is now handled when new batches are ready
+
+		// Determine how many IPs to add
+		needToAdd := currentSize < DesiredPoolSize
+		batchTarget := minInt(PoolAddBatchSize, DesiredPoolSize-currentSize)
+
+		if needsUrgentAddition {
+			minFreshIPsRequired := minInt(10, DesiredPoolSize/10)
+			urgentAddCount := minInt(PoolAddBatchSize*2, minFreshIPsRequired-availableIPs+5)
+			batchTarget = minInt(urgentAddCount, DesiredPoolSize-currentSize)
+			needToAdd = batchTarget > 0
+			if Debug {
+				fmt.Printf("Urgent IP addition: need %d more IPs (exhausted: %d, available: %d)\n",
+					batchTarget, exhaustedIPs, availableIPs)
+			}
 		}
 
+		// Add new IPs if needed (outside lock)
 		if needToAdd && batchTarget > 0 {
-			var wg sync.WaitGroup
-			newIPs := make(chan string, batchTarget)
+			go func(target int) {
+				// Add timeout for the entire batch operation
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
 
-			for i := 0; i < batchTarget; i++ {
-				wg.Add(1)
+				var wg sync.WaitGroup
+				newTrackers := make(chan *IPUsageTracker, target)
+
+				// Use a semaphore to limit concurrent IP additions
+				sem := make(chan struct{}, 3) // Max 3 concurrent IP additions
+
+				for i := 0; i < target; i++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+
+						// Acquire semaphore
+						select {
+						case sem <- struct{}{}:
+							defer func() { <-sem }()
+						case <-ctx.Done():
+							return // Context cancelled
+						}
+
+						newIP := randomIPv6()
+
+						// Add IP with context timeout
+						success := make(chan bool, 1)
+						go func() {
+							success <- addIPv6ToInterface(newIP)
+						}()
+
+						select {
+						case ok := <-success:
+							if ok {
+								tracker := &IPUsageTracker{
+									IP:           normalizeIPv6(newIP),
+									RequestCount: 0,
+									LastUsed:     time.Time{}, // Zero time indicates never used
+									Added:        time.Now(),
+								}
+								select {
+								case newTrackers <- tracker:
+								case <-ctx.Done():
+									return
+								default:
+									// Channel full, skip this tracker
+								}
+							}
+						case <-ctx.Done():
+							return // Context timeout
+						}
+					}()
+				}
+
 				go func() {
-					defer wg.Done()
-					newIP := randomIPv6()
-					if addIPv6ToInterface(newIP) {
-						newIPs <- newIP
+					wg.Wait()
+					close(newTrackers)
+				}()
+
+				addedTrackers := make([]*IPUsageTracker, 0, target)
+
+				// Collect results with timeout
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					for tracker := range newTrackers {
+						addedTrackers = append(addedTrackers, tracker)
 					}
 				}()
-			}
 
-			go func() {
-				wg.Wait()
-				close(newIPs)
-			}()
+				select {
+				case <-done:
+					// Collection completed normally
+				case <-time.After(15 * time.Second):
+					// Timeout collecting results
+					fmt.Printf("Timeout collecting new IP trackers, proceeding with %d collected\n", len(addedTrackers))
+				}
 
-			addedIPs := make([]string, 0, batchTarget)
-			for ip := range newIPs {
-				addedIPs = append(addedIPs, ip)
-			}
+				if len(addedTrackers) > 0 {
+					var oldIPsToFlush []string
 
-			if len(addedIPs) > 0 {
-				poolMutex.Lock()
-				ipPool = append(ipPool, addedIPs...)
-				fmt.Printf("Added %d IPs to pool. Pool size now: %d\n", len(addedIPs), len(ipPool))
-				poolMutex.Unlock()
-			}
+					func() {
+						poolMutex.Lock()
+						defer poolMutex.Unlock()
+
+						newPool := make([]*IPUsageTracker, 0, len(ipPoolWithUsage)+len(addedTrackers))
+						expectedPrefix := IPv6Prefix + ":" + IPv6Subnet + ":"
+
+						// Keep only fresh IPs from the correct subnet and add new ones
+						for _, tracker := range ipPoolWithUsage {
+							inUseCount := atomic.LoadInt32(&tracker.InUseCount)
+
+							// Remove IPs that don't match current subnet configuration
+							if !strings.HasPrefix(tracker.IP, expectedPrefix) {
+								if inUseCount == 0 {
+									oldIPsToFlush = append(oldIPsToFlush, tracker.IP)
+									if Debug {
+										fmt.Printf("Flushing IP from wrong subnet %s - expected prefix %s\n",
+											tracker.IP, expectedPrefix)
+									}
+								} else {
+									// Keep IP temporarily since it's in use
+									newPool = append(newPool, tracker)
+									if Debug {
+										fmt.Printf("Keeping wrong subnet IP %s temporarily (%d ongoing requests)\n",
+											tracker.IP, inUseCount)
+									}
+								}
+							} else if tracker.RequestCount >= MaxRequestsPerIP {
+								if inUseCount == 0 {
+									oldIPsToFlush = append(oldIPsToFlush, tracker.IP)
+									if Debug {
+										fmt.Printf("Flushing old exhausted IP %s (used %d times) - new batch ready\n",
+											tracker.IP, tracker.RequestCount)
+									}
+								} else {
+									newPool = append(newPool, tracker)
+									if Debug {
+										fmt.Printf("Keeping exhausted IP %s temporarily (%d ongoing requests)\n",
+											tracker.IP, inUseCount)
+									}
+								}
+							} else {
+								newPool = append(newPool, tracker)
+							}
+						}
+
+						// Add new trackers
+						newPool = append(newPool, addedTrackers...)
+						ipPoolWithUsage = newPool
+
+						// Reset index if needed
+						if currentIPIndex >= len(ipPoolWithUsage) && len(ipPoolWithUsage) > 0 {
+							currentIPIndex = 0
+						}
+					}()
+
+					// Remove old IPs from interface (outside lock)
+					if len(oldIPsToFlush) > 0 {
+						go func(toFlush []string) {
+							var wg sync.WaitGroup
+							for _, oldIP := range toFlush {
+								wg.Add(1)
+								go func(ip string) {
+									defer wg.Done()
+									removeIPv6FromInterface(ip)
+								}(oldIP)
+							}
+							wg.Wait()
+							fmt.Printf("Flushed %d old IPs when new batch of %d became ready\n",
+								len(toFlush), len(addedTrackers))
+						}(oldIPsToFlush)
+					}
+
+					fmt.Printf("Added %d new IPs to pool, flushed %d old IPs. Pool size now: %d\n",
+						len(addedTrackers), len(oldIPsToFlush), currentSize+len(addedTrackers)-len(oldIPsToFlush))
+				}
+			}(batchTarget)
 		}
-	}
+
+		// Quick stats logging (minimal lock time)
+		if Debug {
+			func() {
+				poolMutex.Lock()
+				defer poolMutex.Unlock()
+
+				totalIPs := len(ipPoolWithUsage)
+				freshIPs := 0
+				for _, tracker := range ipPoolWithUsage {
+					if tracker.RequestCount < MaxRequestsPerIP {
+						freshIPs++
+					}
+				}
+
+				if totalIPs > 0 {
+					exhaustedCount := totalIPs - freshIPs
+					status := "normal"
+					if exhaustedCount > 0 && freshIPs < minInt(10, DesiredPoolSize/10) {
+						status = "using exhausted IPs"
+					}
+					fmt.Printf("Pool stats: %d total IPs, %d fresh, %d exhausted (%s)\n",
+						totalIPs, freshIPs, exhaustedCount, status)
+				}
+			}()
+		}
+	} // End of select loop
 }
 
 func checkPrivileges() bool {
@@ -708,7 +1302,28 @@ func onStartup() bool {
 		return false
 	}
 
-	checkInterface()
+	if !checkInterface() {
+		fmt.Println("WARNING: Interface check failed, but continuing...")
+	}
+
+	fmt.Println("Clearing all existing IPv6 addresses on startup...")
+
+	// Add a small delay to ensure interface is ready
+	time.Sleep(100 * time.Millisecond)
+
+	// Flush in a separate goroutine to avoid blocking startup if there are issues
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recovered from panic during startup flush: %v\n", r)
+			}
+		}()
+		flushAllIPAddresses()
+	}()
+
+	// Wait a moment for flush to start
+	time.Sleep(500 * time.Millisecond)
+
 	testIP := randomIPv6()
 	if !addIPv6ToInterface(testIP) {
 		fmt.Println("WARNING: Failed to add IPv6 address for testing. Some features may not work.")
@@ -719,7 +1334,8 @@ func onStartup() bool {
 }
 
 func main() {
-	ipPool = make([]string, 0, DesiredPoolSize)
+	// Initialize enhanced IP pool with usage tracking
+	ipPoolWithUsage = make([]*IPUsageTracker, 0, DesiredPoolSize)
 	currentIPIndex = 0
 
 	defaultTransport = &http.Transport{
@@ -744,8 +1360,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	go manageIPPool()
-	go periodicIPFlush()
+	// Start background processes with delays to prevent startup congestion
+	go func() {
+		time.Sleep(2 * time.Second) // Wait for server to be ready
+		cleanupWrongSubnetIPs()
+		normalizeIPPool()
+		manageIPPool()
+	}()
+
+	go func() {
+		time.Sleep(5 * time.Second) // Start periodic flush later
+		periodicIPFlush()
+	}()
+
+	go func() {
+		time.Sleep(3 * time.Second) // Start unused IP flush
+		periodicUnusedIPFlush()
+	}()
 
 	http.HandleFunc("/", handleRequest)
 
