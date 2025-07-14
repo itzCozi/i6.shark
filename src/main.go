@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	SharedSecret          = "YCLKMuY0F3xhn.QFwLZ1zYG-6Y3GH_cc" // Secret between client & server
+	SharedSecret          = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
 	Version               = "2.2"                              // Version of the script
 	IPv6Prefix            = "2a01:e5c0:9513"                   // Your /48 prefix
 	IPv6Subnet            = "6000"                             // Using subnet 1000 within your /48
