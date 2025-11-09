@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -22,15 +20,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/andybalholm/brotli"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	SharedSecret          = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
+	SharedSecret          = "mw2kkuz3i0QPyWAeYAllr5f1Vdps6VRN" // Secret between client & server
 	Version               = "2.2"                              // Version of the script
-	IPv6Prefix            = "2a01:e5c0:9513"                   // Your /48 prefix
+	IPv6Prefix            = "2a0a:8dc0:305a"                   // Your /48 prefix
 	IPv6Subnet            = "6000"                             // Using subnet 1000 within your /48
 	Interface             = "ens3"                             // Detected interface from your system
 	ListenPort            = 80                                 // Proxy server port
@@ -67,12 +64,17 @@ var (
 )
 var skipHeaders = map[string]bool{
 	"transfer-encoding": true,
-	"content-encoding":  true,
-	"content-length":    true,
 	"connection":        true,
 	"keep-alive":        true,
 	"server":            true,
 }
+
+// bufferPool is used to reduce allocations when copying response bodies
+var bufferPool = sync.Pool{New: func() interface{} {
+	// 32KB is a reasonable default buffer size
+	b := make([]byte, 32*1024)
+	return &b
+}}
 
 // headersToStripBeforeForwarding defines request headers that should be removed
 // from the incoming client request before forwarding it to the target server.
@@ -769,19 +771,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method == "POST" || r.Method == "PUT" {
-		// We still need to read the incoming body to potentially send it.
-		// Note: For very large uploads, this still reads into memory.
-		// True streaming requires http.Request.GetBody, which is more complex.
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error reading request body: %v", err), http.StatusInternalServerError)
-			return
-		}
-		outRequest.Body = io.NopCloser(bytes.NewReader(body))
-		outRequest.ContentLength = int64(len(body))
+	// Stream incoming request body directly to the upstream without buffering in memory
+	// This supports large uploads efficiently.
+	if r.Body != nil && r.Body != http.NoBody && (r.ContentLength != 0 || len(r.TransferEncoding) > 0) {
+		outRequest.Body = r.Body
+		outRequest.ContentLength = r.ContentLength
 	} else {
-		outRequest.Body = nil
+		outRequest.Body = http.NoBody
+		outRequest.ContentLength = 0
 	}
 
 	outRequest.Header = forwardedHeaders // Use the processed forwardedHeaders
@@ -913,30 +910,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var reader io.Reader = resp.Body
-	contentEncoding := resp.Header.Get("Content-Encoding")
-
-	if strings.Contains(contentEncoding, "br") {
-		reader = brotli.NewReader(resp.Body)
-		w.Header().Del("Content-Encoding")
-		w.Header().Del("Content-Length")
-		if Debug {
-			fmt.Println("Decompressing Brotli response stream")
-		}
-	} else if strings.Contains(contentEncoding, "gzip") {
-		gzipReader, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			fmt.Printf("ERROR: Failed to create gzip reader: %v. Attempting to stream raw body.\n", err)
-		} else {
-			reader = gzipReader
-			defer gzipReader.Close()
-			w.Header().Del("Content-Encoding")
-			w.Header().Del("Content-Length")
-			if Debug {
-				fmt.Println("Decompressing Gzip response stream")
-			}
-		}
-	}
+	// Do not decompress responses; pass through as-is
+	reader := resp.Body
 
 	if Debug {
 		fmt.Println("Response headers being sent to client:")
@@ -949,7 +924,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(resp.StatusCode)
 
-	copiedBytes, err := io.Copy(w, reader)
+	// Use a pooled buffer to efficiently stream the response body
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	copiedBytes, err := io.CopyBuffer(w, reader, *bufPtr)
 	if err != nil {
 		// Error copying response body (e.g., client closed connection)
 		// Can't send HTTP error anymore as headers/status are already sent.
