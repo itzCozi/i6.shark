@@ -38,19 +38,71 @@ const (
 
 ## Usage
 
-1. Build the application:
-```
-go build -o i6shark
+1. Configure constants in src/main.go (example for your VPS):
+```go
+const (
+    SharedSecret          = "REPLACE_WITH_STRONG_RANDOM_SECRET_32_CHARS_MIN"
+    Version               = "2.2"
+    IPv6Prefix            = "2a0a:8dc0:305a" // Your /48
+    IPv6Subnet            = "1000"           // /64 inside the /48
+    Interface             = "ens3"
+    ListenPort            = 80
+    ListenHost            = "0.0.0.0"
+    RequestTimeout        = 30 * time.Second
+    Debug                 = false
+    DesiredPoolSize       = 50
+    PoolManageInterval    = 1 * time.Second
+    PoolAddBatchSize      = 5
+    IPFlushInterval       = 1 * time.Hour
+    MaxRequestsPerIP      = 15
+    UnusedIPFlushInterval = 10 * time.Minute
+    IPInactivityThreshold = 30 * time.Minute
+)
 ```
 
-2. Run with root privileges:
+2. Build the application (Ubuntu 24.04):
+```
+go build -o i6shark ./src
+```
+
+3. Run as root (required for port 80 + IPv6 addr ops):
 ```
 sudo ./i6shark
 ```
 
-3. Send requests through the proxy:
+4. Generate an API token (User-Agent + SharedSecret):
 ```
-curl "http://localhost/?url=https://example.com" -H "API-Token: VALID_API_TOKEN"
+UA="MyClient/1.0"
+SECRET="REPLACE_WITH_STRONG_RANDOM_SECRET_32_CHARS_MIN"
+API_TOKEN=$(echo -n "$SECRET" | openssl dgst -sha256 -mac HMAC -macopt key:"$UA" | awk '{print $2}')
+echo $API_TOKEN
+```
+
+5. Test a request (allowed host example):
+```
+curl -H "User-Agent: MyClient/1.0" -H "API-Token: $API_TOKEN" \
+  "http://localhost/?url=https://rest.opensubtitles.org"
+```
+
+1. Systemd (optional):
+```
+sudo tee /etc/systemd/system/i6shark.service >/dev/null <<'EOF'
+[Unit]
+Description=i6.shark IPv6 proxy
+After=network-online.target
+Wants=network-online.target
+[Service]
+WorkingDirectory=/workspaces/i6.shark
+ExecStart=/workspaces/i6.shark/i6shark
+Restart=always
+RestartSec=3
+User=root
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now i6shark
 ```
 
 > **Python Version:**  
