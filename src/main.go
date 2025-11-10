@@ -25,22 +25,22 @@ import (
 )
 
 const (
-	SharedSecret          = "mw2kkuz3i0QPyWAeYAllr5f1Vdps6VRN" // Secret between client & server
-	Version               = "2.2"                              // Version of the script
-	IPv6Prefix            = "2a0a:8dc0:305a"                   // Your /48 prefix
-	IPv6Subnet            = "6000"                             // Using subnet 1000 within your /48
-	Interface             = "ens3"                             // Detected interface from your system
-	ListenPort            = 80                                 // Proxy server port
-	ListenHost            = "0.0.0.0"                          // Listen on all interfaces
-	RequestTimeout        = 30 * time.Second                   // Request timeout in seconds
-	Debug                 = false                              // Enable debug output
-	DesiredPoolSize       = 50                                 // Target number of IPs in the pool (Increased for high concurrency)
-	PoolManageInterval    = 1 * time.Second                    // Check/add very frequently with minimal blocking
-	PoolAddBatchSize      = 5                                  // Larger batches for faster pool growth
-	IPFlushInterval       = 1 * time.Hour                      // Flush all IPs every hour
-	MaxRequestsPerIP      = 15                                 // Maximum requests allowed per IP before rotation
-	UnusedIPFlushInterval = 10 * time.Minute                   // Check for unused IPs every 10 minutes
-	IPInactivityThreshold = 30 * time.Minute                   // Remove IP if unused for this duration
+	SharedSecret          = "REPLACE_WITH_RANDOM_SECRET_32_CHARS" // Secret between client & server
+	Version               = "2.2"                                 // Version of the script
+	IPv6Prefix            = "2a0a:8dc0:305a"                      // Your /48 prefix
+	IPv6Subnet            = "6000"                                // Using subnet 1000 within your /48
+	Interface             = "ens3"                                // Detected interface from your system
+	ListenPort            = 80                                    // Proxy server port
+	ListenHost            = "0.0.0.0"                             // Listen on all interfaces
+	RequestTimeout        = 30 * time.Second                      // Request timeout in seconds
+	Debug                 = false                                 // Enable debug output
+	DesiredPoolSize       = 50                                    // Target number of IPs in the pool (Increased for high concurrency)
+	PoolManageInterval    = 1 * time.Second                       // Check/add very frequently with minimal blocking
+	PoolAddBatchSize      = 5                                     // Larger batches for faster pool growth
+	IPFlushInterval       = 1 * time.Hour                         // Flush all IPs every hour
+	MaxRequestsPerIP      = 15                                    // Maximum requests allowed per IP before rotation
+	UnusedIPFlushInterval = 10 * time.Minute                      // Check for unused IPs every 10 minutes
+	IPInactivityThreshold = 30 * time.Minute                      // Remove IP if unused for this duration
 )
 
 // IPUsageTracker tracks usage statistics for each IP address
