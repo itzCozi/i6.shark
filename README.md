@@ -4,38 +4,66 @@ An IPv6 proxy server that allows you to make HTTP requests from randomly generat
 
 ## Features
 
-- Generates random IPv6 addresses based on your IPv6 prefix
-- Full HTTP method support (GET, POST, PUT, DELETE, etc.)
-- API key authentication for secure usage
+- **Random IPv6 Generation**: Creates random IPv6 addresses from your /48 prefix for each request
+- **Full HTTP Method Support**: GET, POST, PUT, DELETE, and all other HTTP methods
+- **HMAC-SHA256 Authentication**: Secure API key authentication using user-agent based tokens
+- **Intelligent IP Pool Management**: 
+  - Automatic IP rotation with configurable pool size
+  - Smart IP lifecycle management (add, track usage, auto-flush)
+  - Per-IP request counting with automatic rotation after max requests
+  - Unused IP cleanup based on inactivity threshold
+- **Advanced Request Handling**:
+  - Custom header forwarding via JSON query parameter
+  - Cloudflare and CDN header stripping for anonymity
+  - Support for multiple URL parameter formats (`?url=`, `?destination=`, or path-based)
+  - Optional fallback to system default IP with `?normal` parameter
+- **Host Whitelisting**: Built-in domain whitelist for security (configurable in code)
+- **Automatic Maintenance**:
+  - Periodic IP pool flushing (hourly by default)
+  - Subnet validation and cleanup
+  - Connection pooling and keepalive optimization
+- **High Performance**:
+  - Concurrent request handling with buffer pooling
+  - Configurable timeouts and connection limits
+  - Efficient IPv6 address management via netlink
+- **Debug Mode**: Detailed logging for troubleshooting and monitoring
 - [Community Made Docker Support](https://github.com/SpencerDevs/complex-proxy/blob/main/Dockerfile)
 
 ## Requirements
 
 - Go 1.20 or higher
-- Linux/Unix system with IPv6 support (preferably Ubuntu latest)
+- Linux/Unix system with IPv6 support (preferably Ubuntu)
 - Root privileges (for port 80 binding and IPv6 manipulation)
+- IPv6 /48 subnet allocation from your hosting provider
+
+## Hosting Providers
+- [Clouvider](https://clouvider.co.uk/) - All payments
+- [BuyVM](https://buyvm.net/) - All payments
+- [SoftShellWeb](https://softshellweb.com/) - All payments
+- [Aeza](https://aeza.io/) - BTC only 11/11/25
 
 ## Usage
 
 1. **Configure** constants in src/main.go (example for your VPS):
 ```go
 const (
-  SharedSecret          = "REPLACE_WITH_RANDOM_SECRET_32_CHARS"            // Secret between client & server
-  Version               = "2.2"                                            // Version of the proxy
-  IPv6Prefix            = "2a0a:8dc0:305a"                                 // Your /48 prefix
-  IPv6Subnet            = "1000"                                           // Using /64 inside the /48
-  Interface             = "ens3"                                           // Network interface on your system
-  ListenPort            = 80                                               // Proxy server port
-  ListenHost            = "0.0.0.0"                                        // Listen on all interfaces
-  RequestTimeout        = 30 * time.Second                                 // Timeout for outbound proxied requests
-  Debug                 = false                                            // Enable verbose debug logging
-  DesiredPoolSize       = 50                                               // Target number of IPv6 addresses in the pool
-  PoolManageInterval    = 1 * time.Second                                  // How often to check/maintain the pool
-  PoolAddBatchSize      = 5                                                // Max number of IPs to try adding per cycle
-  IPFlushInterval       = 1 * time.Hour                                    // Periodic full pool refresh (rebuild/flush)
-  MaxRequestsPerIP      = 15                                               // Rotate an IP after this many proxied requests
-  UnusedIPFlushInterval = 10 * time.Minute                                 // Remove IPs that have been unused for this long
-  IPInactivityThreshold = 30 * time.Minute                                 // Mark an IP inactive after this idle duration
+	SharedSecret          = "REPLACE_WITH_RANDOM_SECRET_32_CHARS" // Secret between client & server
+	Version               = "2.3"                                 // Version of the script
+	IPv6Prefix            = "2a0a:8dc0:305a"                      // Your /48 prefix
+	IPv6Subnet            = "6000"                                // Using subnet 1000 within your /48
+	Interface             = "ens3"                                // Detected interface from your system
+	ListenPort            = 80                                    // Proxy server port
+	ListenHost            = "0.0.0.0"                             // Listen on all interfaces
+	RequestTimeout        = 30 * time.Second                      // Request timeout in seconds
+	Debug                 = false                                 // Enable debug output
+	RequireAuth           = true                                  // Require API-Token authentication
+	DesiredPoolSize       = 50                                    // Target number of IPs in the pool (Increased for high concurrency)
+	PoolManageInterval    = 1 * time.Second                       // Check/add very frequently with minimal blocking
+	PoolAddBatchSize      = 5                                     // Larger batches for faster pool growth
+	IPFlushInterval       = 1 * time.Hour                         // Flush all IPs every hour
+	MaxRequestsPerIP      = 15                                    // Maximum requests allowed per IP before rotation
+	UnusedIPFlushInterval = 10 * time.Minute                      // Check for unused IPs every 10 minutes
+	IPInactivityThreshold = 30 * time.Minute                      // Remove IP if unused for this duration
 )
 ```
 
