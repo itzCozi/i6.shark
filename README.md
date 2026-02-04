@@ -101,6 +101,12 @@ sudo systemctl enable --now i6shark
 ```
 <sub>The proxy server should be able to run without interruption or maintenance it will upkeep it self.</sub>
 
+1. **Daily Restart** (optional):
+```bash
+# Add a cron job to restart the server daily at a random time
+(crontab -l 2>/dev/null; echo "$(shuf -i 0-59 -n 1) $(shuf -i 0-23 -n 1) * * * systemctl restart i6shark") | crontab -
+```
+
 > **Python Version:**  
 > You may also use the python version though, *it is not recommended* as it is not as slower and not up to date.
 
