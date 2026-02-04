@@ -49,7 +49,7 @@ An IPv6 proxy server that allows you to make HTTP requests from randomly generat
 const (
 	SharedSecret          = "REPLACE_WITH_RANDOM_SECRET_32_CHARS" // Secret between client & server
 	Version               = "2.3"                                 // Version of the script
-	IPv6Prefix            = "2a0a:8dc0:305a"                      // Your /48 prefix
+	IPv6Prefix            = "xxxx:xxxx:xxxx"                      // Your /48 prefix
 	IPv6Subnet            = "6000"                                // Using subnet 1000 within your /48
 	Interface             = "ens3"                                // Detected interface from your system
 	ListenPort            = 80                                    // Proxy server port
@@ -86,8 +86,8 @@ Description=i6.shark IPv6 proxy
 After=network-online.target
 Wants=network-online.target
 [Service]
-WorkingDirectory=/workspaces/i6.shark
-ExecStart=/workspaces/i6.shark/i6shark
+WorkingDirectory=/opt/i6.shark
+ExecStart=/opt/i6.shark/i6shark
 Restart=always
 RestartSec=3
 User=root
